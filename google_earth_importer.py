@@ -1,29 +1,22 @@
 # -*- coding: utf-8 -*-
 """Import Google Earth KML/KMZ into AutoCAD while preserving colors.
 
-Main purpose for the Geographic app:
-- Read KML/KMZ exported/copied from Google Earth Pro.
-- Preserve Google Earth style color into AutoCAD TrueColor when possible.
-- Preserve folder/name/style metadata as layer/object information.
-- Support Point, LineString and Polygon placemarks.
-
 KML color format is AABBGGRR. AutoCAD TrueColor expects RGB.
+This version fixes color assignment by using versioned AcCmColor ProgIDs
+and ACI fallback when TrueColor fails.
 """
 
 from __future__ import annotations
 
-import os
 import re
-import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 Point3 = Tuple[float, float, float]
 Color = Tuple[int, int, int]
-
 KML_NS = {"kml": "http://www.opengis.net/kml/2.2"}
 
 
@@ -32,25 +25,35 @@ def strip_ns(tag: str) -> str:
 
 
 def kml_color_to_rgb(value: Optional[str]) -> Optional[Color]:
-    """Convert KML AABBGGRR to RGB."""
     if not value:
         return None
     s = value.strip().replace("#", "")
-    if len(s) == 8:
-        # aa bb gg rr
-        try:
-            b = int(s[2:4], 16)
-            g = int(s[4:6], 16)
-            r = int(s[6:8], 16)
-            return r, g, b
-        except ValueError:
-            return None
-    if len(s) == 6:
-        try:
+    try:
+        if len(s) == 8:
+            return int(s[6:8], 16), int(s[4:6], 16), int(s[2:4], 16)
+        if len(s) == 6:
             return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
-        except ValueError:
-            return None
+    except ValueError:
+        return None
     return None
+
+
+def rgb_to_aci(rgb: Optional[Color]) -> int:
+    if rgb is None:
+        return 256
+    r, g, b = rgb
+    palette = {
+        1: (255, 0, 0),
+        2: (255, 255, 0),
+        3: (0, 255, 0),
+        4: (0, 255, 255),
+        5: (0, 0, 255),
+        6: (255, 0, 255),
+        7: (255, 255, 255),
+        8: (128, 128, 128),
+        9: (192, 192, 192),
+    }
+    return min(palette, key=lambda i: (palette[i][0] - r) ** 2 + (palette[i][1] - g) ** 2 + (palette[i][2] - b) ** 2)
 
 
 def safe_layer_name(text: str) -> str:
@@ -80,6 +83,7 @@ class GEFeature:
     geom_type: str
     coords: List[Point3]
     color: Optional[Color]
+    line_width: float = 1.0
     style_url: str = ""
     description: str = ""
 
@@ -91,17 +95,15 @@ class GoogleEarthKmlReader:
         self.styles = self._read_styles()
 
     def _load_root(self):
-        path = self.path
-        if path.suffix.lower() == ".kmz":
-            with zipfile.ZipFile(path, "r") as zf:
+        if self.path.suffix.lower() == ".kmz":
+            with zipfile.ZipFile(self.path, "r") as zf:
                 names = zf.namelist()
                 kml_name = "doc.kml" if "doc.kml" in names else next(n for n in names if n.lower().endswith(".kml"))
-                data = zf.read(kml_name)
-            return ET.fromstring(data)
-        return ET.parse(path).getroot()
+                return ET.fromstring(zf.read(kml_name))
+        return ET.parse(self.path).getroot()
 
-    def _read_styles(self) -> Dict[str, Optional[Color]]:
-        styles: Dict[str, Optional[Color]] = {}
+    def _read_styles(self) -> Dict[str, Dict[str, object]]:
+        styles: Dict[str, Dict[str, object]] = {}
         for style in self.root.iter():
             if strip_ns(style.tag) != "Style":
                 continue
@@ -109,12 +111,17 @@ class GoogleEarthKmlReader:
             if not sid:
                 continue
             color = None
+            width = 1.0
             for node in style.iter():
-                if strip_ns(node.tag) == "color" and node.text:
-                    color = kml_color_to_rgb(node.text)
-                    if color:
-                        break
-            styles["#" + sid] = color
+                tag = strip_ns(node.tag)
+                if tag == "color" and node.text:
+                    color = kml_color_to_rgb(node.text) or color
+                elif tag == "width" and node.text:
+                    try:
+                        width = float(node.text)
+                    except ValueError:
+                        pass
+            styles["#" + sid] = {"color": color, "width": width}
         for style_map in self.root.iter():
             if strip_ns(style_map.tag) != "StyleMap":
                 continue
@@ -143,7 +150,8 @@ class GoogleEarthKmlReader:
         tag = strip_ns(node.tag)
         if tag == "Folder":
             name_node = node.find("./kml:name", KML_NS)
-            folder = name_node.text.strip() if name_node is not None and name_node.text else folder
+            if name_node is not None and name_node.text:
+                folder = name_node.text.strip()
         if tag == "Placemark":
             feature = self._placemark(node, folder)
             if feature:
@@ -159,13 +167,20 @@ class GoogleEarthKmlReader:
         name = name_node.text.strip() if name_node is not None and name_node.text else "GoogleEarth_Object"
         desc = desc_node.text.strip() if desc_node is not None and desc_node.text else ""
         style_url = style_node.text.strip() if style_node is not None and style_node.text else ""
-        color = self.styles.get(style_url)
+        style = self.styles.get(style_url, {})
+        color = style.get("color")
+        width = float(style.get("width") or 1.0)
         inline_style = pm.find("./kml:Style", KML_NS)
         if inline_style is not None:
             for n in inline_style.iter():
-                if strip_ns(n.tag) == "color" and n.text:
+                tag = strip_ns(n.tag)
+                if tag == "color" and n.text:
                     color = kml_color_to_rgb(n.text) or color
-                    break
+                elif tag == "width" and n.text:
+                    try:
+                        width = float(n.text)
+                    except ValueError:
+                        pass
         for geom in pm.iter():
             gtag = strip_ns(geom.tag)
             if gtag in ("Point", "LineString", "LinearRing"):
@@ -173,12 +188,12 @@ class GoogleEarthKmlReader:
                 pts = parse_coord_text(coord.text if coord is not None else "")
                 if pts:
                     geom_type = "Point" if gtag == "Point" else "LineString"
-                    return GEFeature(name, folder, geom_type, pts, color, style_url, desc)
+                    return GEFeature(name, folder, geom_type, pts, color, width, style_url, desc)
             if gtag == "Polygon":
                 coord = geom.find(".//kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", KML_NS)
                 pts = parse_coord_text(coord.text if coord is not None else "")
                 if pts:
-                    return GEFeature(name, folder, "Polygon", pts, color, style_url, desc)
+                    return GEFeature(name, folder, "Polygon", pts, color, width, style_url, desc)
         return None
 
 
@@ -199,12 +214,40 @@ class AutoCADGoogleEarthImporter:
     def _truecolor(self, rgb: Optional[Color]):
         if rgb is None:
             return None
+        r, g, b = [int(max(0, min(255, c))) for c in rgb]
+        app = getattr(self.doc, "Application", None) or self.acad
+        progids = []
         try:
-            color = self.acad.GetInterfaceObject("AutoCAD.AcCmColor")
-            color.SetRGB(int(rgb[0]), int(rgb[1]), int(rgb[2]))
-            return color
+            major = str(app.Version).split(".")[0]
+            if major:
+                progids.append(f"AutoCAD.AcCmColor.{major}")
         except Exception:
-            return None
+            pass
+        progids.extend(["AutoCAD.AcCmColor", "AutoCAD.AcCmColor.25", "AutoCAD.AcCmColor.24", "AutoCAD.AcCmColor.23", "AutoCAD.AcCmColor.22"])
+        for progid in progids:
+            try:
+                color = app.GetInterfaceObject(progid)
+                color.SetRGB(r, g, b)
+                return color
+            except Exception:
+                continue
+        return None
+
+    def _apply_color(self, obj, rgb: Optional[Color]) -> bool:
+        if rgb is None:
+            return False
+        tc = self._truecolor(rgb)
+        if tc is not None:
+            try:
+                obj.TrueColor = tc
+                return True
+            except Exception:
+                pass
+        try:
+            obj.Color = rgb_to_aci(rgb)
+            return True
+        except Exception:
+            return False
 
     def _ensure_layer(self, name: str, rgb: Optional[Color]) -> str:
         lname = safe_layer_name(name)
@@ -212,12 +255,7 @@ class AutoCADGoogleEarthImporter:
             layer = self.doc.Layers.Item(lname)
         except Exception:
             layer = self.doc.Layers.Add(lname)
-        tc = self._truecolor(rgb)
-        if tc is not None:
-            try:
-                layer.TrueColor = tc
-            except Exception:
-                pass
+        self._apply_color(layer, rgb)
         return lname
 
     def _apply_common(self, obj, feature: GEFeature, layer_name: str) -> None:
@@ -225,12 +263,13 @@ class AutoCADGoogleEarthImporter:
             obj.Layer = layer_name
         except Exception:
             pass
-        tc = self._truecolor(feature.color)
-        if tc is not None:
-            try:
-                obj.TrueColor = tc
-            except Exception:
-                pass
+        applied = self._apply_color(obj, feature.color)
+        if not applied and feature.color is not None:
+            self.log(f"Không gán được màu cho {feature.name}: {feature.color}")
+        try:
+            obj.Lineweight = max(0, min(211, int(feature.line_width * 25)))
+        except Exception:
+            pass
         try:
             obj.Hyperlinks.Add("Google Earth Style", feature.style_url)
         except Exception:
@@ -270,9 +309,8 @@ class AutoCADGoogleEarthImporter:
         for x, y, _z in pts:
             flat.extend([x, y])
         if feature.geom_type == "Polygon":
-            if pts[0][:2] != pts[-1][:2]:
-                x, y, _z = pts[0]
-                flat.extend([x, y])
+            if pts and pts[0][:2] != pts[-1][:2]:
+                flat.extend([pts[0][0], pts[0][1]])
             obj = ms.AddLightWeightPolyline(tuple(flat))
             try:
                 obj.Closed = True

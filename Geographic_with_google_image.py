@@ -33,28 +33,45 @@ _ORIGINAL_BUILD_UI = base.GeographicApp._build_ui
 
 
 def _patched_build_ui(self):
-    """Replace the main button row with the same UI plus Google Earth image."""
+    """Use two button rows so no command is hidden on small screens."""
+    try:
+        self.root.geometry("820x360")
+        self.root.resizable(False, False)
+    except Exception:
+        pass
+
     main = ttk.Frame(self.root, padding=8)
     main.pack(fill="both", expand=True)
+
     button_frame = ttk.Frame(main)
     button_frame.pack(fill="x")
 
-    buttons = [
+    row1 = [
         ("Hệ tọa độ", self.on_coordinate_system),
         ("Xuất KML/KMZ", self.on_export_kml_kmz),
         ("Nhập KML/KMZ", self.on_import_kml_kmz),
+    ]
+    row2 = [
         ("Lấy từ GG Earth", self.on_get_from_google_earth),
         ("Ảnh Google Earth", self.on_google_earth_image),
         ("Lựa chọn", self.on_selection),
     ]
-    for i, (text, command) in enumerate(buttons):
-        ttk.Button(button_frame, text=text, command=command).grid(row=0, column=i, padx=3, pady=3, sticky="nsew")
-        button_frame.columnconfigure(i, weight=1)
+
+    for row_index, row_buttons in enumerate((row1, row2)):
+        for col_index, (text, command) in enumerate(row_buttons):
+            ttk.Button(button_frame, text=text, command=command).grid(
+                row=row_index,
+                column=col_index,
+                padx=3,
+                pady=3,
+                sticky="nsew",
+            )
+            button_frame.columnconfigure(col_index, weight=1, uniform="button_col")
 
     ttk.Label(main, text="Thông báo").pack(anchor="w", pady=(8, 2))
     msg_frame = ttk.Frame(main)
     msg_frame.pack(fill="both", expand=True)
-    self.message = tk.Text(msg_frame, height=10, wrap="word", state="disabled", font=("Consolas", 10))
+    self.message = tk.Text(msg_frame, height=11, wrap="word", state="disabled", font=("Consolas", 10))
     self.message.pack(side="left", fill="both", expand=True)
     scrollbar = ttk.Scrollbar(msg_frame, command=self.message.yview)
     scrollbar.pack(side="right", fill="y")
